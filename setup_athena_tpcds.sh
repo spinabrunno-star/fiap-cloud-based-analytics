@@ -3,21 +3,35 @@ set -Eeuo pipefail
 export AWS_PAGER=""
 
 #############################################
-# setup_athena_tpcds.sh
+# setup_athena_tpcds_fixed.sh
 #
 # - Descobre accountID (STS)
 # - Cria bucket: otfs-aula-$accountID (idempotente)
-# - Baixa arquivo do Google Drive e faz upload do conteúdo ao bucket
+# - Baixa ZIP público do Google Drive (sem login), valida que é ZIP (não HTML)
+# - Extrai e valida estrutura de diretórios esperada (datasets/TPC-DS-100-GB/...)
+# - Faz upload APENAS do prefixo datasets/ para o bucket
 # - Configura Athena (WorkGroup) para resultados em s3://bucket/athena-results/
 # - Cria database tpcds e as tabelas (idempotente)
 # - Substitui "$accountID" literal nos DDLs
+#
+# Requisitos na máquina Ubuntu:
+#   - awscli v2
+#   - curl
+#   - tar
+#   - unzip
+#   - file (pacote 'file')
+#
+# Execução:
+#   chmod +x setup_athena_tpcds_fixed.sh
+#   ./setup_athena_tpcds_fixed.sh
 #############################################
 
-LINK_ARQUIVO="https://drive.google.com/file/d/1w0ZEj4pogi5HlOBnBrU562Ya0AjL-58Y/view?usp=sharing"
+LINK_ARQUIVO="https://drive.google.com/file/d/1-UZ5gYO3JsKVibhw53f8YIhnjwciqO3-/view?usp=sharing"
 ATHENA_WORKGROUP="otfs-aula-workgroup"
 WORKDIR="/tmp/otfs-aula-setup"
 
-TOTAL_STEPS=15
+# Quantidade REAL de etapas que chamam progress() abaixo.
+TOTAL_STEPS=19
 CURRENT_STEP=0
 
 progress() {
@@ -44,7 +58,7 @@ on_error() {
 trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
 
 need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "Comando obrigatório não encontrado: $1"
+  command -v "$1" >/dev/null 2>&1 || die "Comando obrigatório não encontrado: $1 (instale e rode novamente)."
 }
 
 detect_region() {
@@ -71,57 +85,105 @@ detect_region() {
   echo "$region"
 }
 
-# Download Google Drive via curl, lidando com confirm token (quando aparece)
-gdrive_download() {
+#############################################
+# Google Drive: download robusto (sem login)
+# - Drive pode retornar HTML de confirmação/limite em vez do arquivo
+# - Esta função:
+#   1) tenta baixar diretamente;
+#   2) se receber HTML, extrai token confirm= do HTML ou cookie download_warning;
+#   3) baixa novamente com confirm;
+#   4) valida que o resultado NÃO é HTML e que é um ZIP válido (unzip -t)
+#############################################
+gdrive_download_zip_or_die() {
   local file_id="$1"
   local out_path="$2"
+
   local cookie_file="$WORKDIR/gdrive_cookie.txt"
+  local hdr1="$WORKDIR/gdrive_hdr1.txt"
+  local hdr2="$WORKDIR/gdrive_hdr2.txt"
+  local tmp1="$WORKDIR/gdrive_tmp1.bin"
 
-  rm -f "$cookie_file" || true
+  rm -f "$cookie_file" "$hdr1" "$hdr2" "$tmp1" "$out_path" || true
 
-  # 1) Primeira chamada para capturar confirm token (se existir)
-  local confirm
-  confirm="$(curl -sS -c "$cookie_file" "https://drive.google.com/uc?export=download&id=${file_id}" \
-    | sed -n 's/.*confirm=\([0-9A-Za-z_]\+\).*/\1/p' | head -n1 || true)"
+  echo "Baixando do Google Drive (tentativa 1/2)..."
+  curl -fsSL --retry 5 --retry-all-errors --retry-delay 1 \
+    -c "$cookie_file" -D "$hdr1" \
+    "https://drive.google.com/uc?export=download&id=${file_id}" \
+    -o "$tmp1"
 
-  # 2) Download final
-  if [[ -n "$confirm" ]]; then
-    curl -sS -L -b "$cookie_file" \
+  # Content-Type pode vir com ; charset=...
+  local ctype1
+  ctype1="$(grep -i '^content-type:' "$hdr1" | tail -n1 | tr -d '\r' | awk '{print $2}' | cut -d';' -f1 || true)"
+
+  if [[ "$ctype1" != "text/html" ]]; then
+    mv "$tmp1" "$out_path"
+  else
+    echo "Resposta HTML detectada. Obtendo token de confirmação..."
+    local confirm=""
+    confirm="$(tr '\n' ' ' < "$tmp1" | sed -n 's/.*confirm=\([0-9A-Za-z_]\+\).*/\1/p' | head -n1 || true)"
+    if [[ -z "$confirm" ]]; then
+      confirm="$(awk '/download_warning/ {print $NF}' "$cookie_file" | tail -n1 || true)"
+    fi
+    [[ -n "$confirm" ]] || die "Google Drive retornou HTML e não foi possível extrair token de confirmação. Verifique se o arquivo está público."
+
+    echo "Baixando do Google Drive (tentativa 2/2) com token..."
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 1 \
+      -b "$cookie_file" -D "$hdr2" \
       "https://drive.google.com/uc?export=download&confirm=${confirm}&id=${file_id}" \
       -o "$out_path"
-  else
-    curl -sS -L -b "$cookie_file" \
-      "https://drive.google.com/uc?export=download&id=${file_id}" \
-      -o "$out_path"
   fi
 
-  [[ -s "$out_path" ]] || die "Falha no download do Google Drive ou arquivo vazio. Verifique se o link está público."
+  [[ -s "$out_path" ]] || die "Falha no download do Google Drive ou arquivo vazio."
+
+  # Proteção contra subir HTML por engano
+  local mime
+  mime="$(file -b --mime-type "$out_path" || true)"
+  if [[ "$mime" == "text/html" ]]; then
+    die "Download inválido: o Drive retornou HTML (página de confirmação/erro), não o ZIP. Verifique se o link está público."
+  fi
+
+  # Valida ZIP de verdade (estrutura/CRC)
+  if ! unzip -t "$out_path" >/dev/null 2>&1; then
+    die "Arquivo baixado não é um ZIP válido (unzip -t falhou). É provável que o Drive não entregou o binário esperado."
+  fi
+
+  echo "Download OK e ZIP validado: $out_path"
 }
 
-extract_if_archive() {
-  local input="$1"
+#############################################
+# Extração + validação de estrutura
+# Espera encontrar:
+# - datasets/TPC-DS-100-GB/prepared_customer/
+# - datasets/TPC-DS-100-GB/prepared_web_sales/
+# Se o ZIP vier com TPC-DS-100-GB/ na raiz, reorganiza para datasets/
+#############################################
+extract_zip_and_validate_or_die() {
+  local zip_path="$1"
   local out_dir="$2"
+
+  rm -rf "$out_dir"
   mkdir -p "$out_dir"
 
-  # ZIP
-  if command -v unzip >/dev/null 2>&1; then
-    if unzip -t "$input" >/dev/null 2>&1; then
-      unzip -o "$input" -d "$out_dir" >/dev/null
-      echo "$out_dir"
-      return 0
-    fi
+  unzip -o "$zip_path" -d "$out_dir" >/dev/null
+
+  # Normaliza a raiz do dataset para datasets/TPC-DS-100-GB
+  if [[ -d "$out_dir/datasets/TPC-DS-100-GB" ]]; then
+    :
+  elif [[ -d "$out_dir/TPC-DS-100-GB" ]]; then
+    mkdir -p "$out_dir/datasets"
+    mv "$out_dir/TPC-DS-100-GB" "$out_dir/datasets/"
+  else
+    die "Estrutura inesperada no ZIP. Não encontrei 'datasets/TPC-DS-100-GB' nem 'TPC-DS-100-GB'. Abortando para evitar upload incorreto ao S3."
   fi
 
-  # TAR (inclui .tar.gz/.tgz)
-  if tar -tf "$input" >/dev/null 2>&1; then
-    tar -xf "$input" -C "$out_dir"
-    echo "$out_dir"
-    return 0
-  fi
+  # Valida diretórios essenciais para as tabelas prepared_*
+  [[ -d "$out_dir/datasets/TPC-DS-100-GB/prepared_customer" ]] || die "ZIP extraído, mas não encontrei datasets/TPC-DS-100-GB/prepared_customer. Estrutura não compatível com os DDLs."
+  [[ -d "$out_dir/datasets/TPC-DS-100-GB/prepared_web_sales" ]] || die "ZIP extraído, mas não encontrei datasets/TPC-DS-100-GB/prepared_web_sales. Estrutura não compatível com os DDLs."
 
-  # Não é archive
-  cp -f "$input" "$out_dir/"
-  echo "$out_dir"
+  # Garante que existem arquivos dentro (evita diretórios vazios)
+  if ! find "$out_dir/datasets/TPC-DS-100-GB" -type f | head -n 1 | grep -q .; then
+    die "ZIP extraído, mas não encontrei nenhum arquivo dentro de datasets/TPC-DS-100-GB. Abortando."
+  fi
 }
 
 ensure_bucket() {
@@ -140,8 +202,7 @@ ensure_bucket() {
     aws s3api create-bucket --bucket "$bucket" --create-bucket-configuration "LocationConstraint=$region" >/dev/null 2>&1 || true
   fi
 
-  # Revalida
-  aws s3api head-bucket --bucket "$bucket" >/dev/null 2>&1 || die "Não foi possível criar/acessar o bucket s3://$bucket (nome já pode existir em outra conta, ou falta permissão)."
+  aws s3api head-bucket --bucket "$bucket" >/dev/null 2>&1 || die "Não foi possível criar/acessar o bucket s3://$bucket (nome pode existir em outra conta, ou falta permissão)."
 }
 
 ensure_workgroup() {
@@ -203,19 +264,12 @@ athena_exec_and_wait() {
 }
 
 # Preparação segura do DDL:
-# 1) Substitui o literal "$accountID" SEM depender de sed/escapes
-# 2) Garante idempotência inserindo IF NOT EXISTS
+# 1) Substitui o literal "$accountID" sem sed
+# 2) Injeta IF NOT EXISTS para idempotência
 prepare_ddl() {
   local ddl="$1"
-
-  # Substitui exatamente o texto "$accountID" (literal) pelo valor real.
-  # O \ antes do $ impede o Bash de tratar como variável.
   ddl="${ddl//\$accountID/$accountID}"
-
-  # Garante "IF NOT EXISTS" para idempotência.
-  # Aplica apenas na linha inicial que começa com CREATE EXTERNAL TABLE
   ddl="$(echo "$ddl" | sed -E 's/^CREATE[[:space:]]+EXTERNAL[[:space:]]+TABLE[[:space:]]+/CREATE EXTERNAL TABLE IF NOT EXISTS /')"
-
   echo "$ddl"
 }
 
@@ -223,16 +277,20 @@ prepare_ddl() {
 # Execução
 #########################################
 
-progress "Validando pré-requisitos (aws, curl, tar)..."
+progress "Validando pré-requisitos (aws, curl, tar, unzip, file)..."
 need_cmd aws
 need_cmd curl
 need_cmd tar
+need_cmd unzip
+need_cmd file
 
 progress "Preparando diretório de trabalho..."
 mkdir -p "$WORKDIR"
 
 progress "Detectando região AWS..."
 REGION="$(detect_region)"
+export AWS_REGION="$REGION"
+export AWS_DEFAULT_REGION="$REGION"
 echo "Região: $REGION"
 
 progress "Obtendo accountID via STS..."
@@ -255,26 +313,20 @@ FILE_ID="$(echo "$LINK_ARQUIVO" | sed -n 's#.*\/d\/\([^\/]*\)\/.*#\1#p')"
 [[ -n "$FILE_ID" ]] || die "Não foi possível extrair o fileId do link."
 echo "Google Drive fileId: $FILE_ID"
 
-progress "Baixando arquivo do Google Drive (curl)..."
-DOWNLOADED_FILE="$WORKDIR/artifact_download.bin"
-gdrive_download "$FILE_ID" "$DOWNLOADED_FILE"
-echo "Arquivo baixado em: $DOWNLOADED_FILE"
+progress "Baixando ZIP do Google Drive (robusto e validado)..."
+DOWNLOADED_ZIP="$WORKDIR/artifact.zip"
+gdrive_download_zip_or_die "$FILE_ID" "$DOWNLOADED_ZIP"
 
-progress "Verificando unzip (para ZIP) e extraindo conteúdo..."
-if ! command -v unzip >/dev/null 2>&1; then
-  echo "Aviso: 'unzip' não encontrado. Se o arquivo for ZIP, a extração falhará."
-  echo "Recomendação: sudo apt-get update && sudo apt-get install -y unzip"
-fi
-
+progress "Extraindo ZIP e validando estrutura datasets/TPC-DS-100-GB..."
 EXTRACT_DIR="$WORKDIR/extracted"
-rm -rf "$EXTRACT_DIR"
-mkdir -p "$EXTRACT_DIR"
-extract_if_archive "$DOWNLOADED_FILE" "$EXTRACT_DIR" >/dev/null
-echo "Conteúdo pronto em: $EXTRACT_DIR"
+extract_zip_and_validate_or_die "$DOWNLOADED_ZIP" "$EXTRACT_DIR"
+echo "Conteúdo validado em: $EXTRACT_DIR/datasets/TPC-DS-100-GB"
 
-progress "Upload do conteúdo para o bucket (aws s3 sync, idempotente)..."
-aws s3 sync "$EXTRACT_DIR/" "s3://$BUCKET/" --only-show-errors
-echo "Upload concluído."
+progress "Upload do dataset para o bucket (prefixo datasets/, idempotente)..."
+# Sobe APENAS o prefixo datasets/ para não sobrescrever athena-results/ nem outros objetos.
+# --delete fica restrito a datasets/ para convergir ao mesmo resultado em re-execuções.
+aws s3 sync "$EXTRACT_DIR/datasets/" "s3://$BUCKET/datasets/" --delete --only-show-errors
+echo "Upload concluído: s3://$BUCKET/datasets/"
 
 progress "Criando/atualizando WorkGroup do Athena (idempotente)..."
 ensure_workgroup "$ATHENA_WORKGROUP" "$ATHENA_OUTPUT"
