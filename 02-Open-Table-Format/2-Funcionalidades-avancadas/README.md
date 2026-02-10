@@ -118,7 +118,7 @@ Observação: [MERGE INTO](https://docs.aws.amazon.com/athena/latest/ug/merge-in
 Você criará a tabela `merge_table` e a usará para mesclar registros na tabela de destino `athena_iceberg_db.web_sales_iceberg`.
 
 
-1. Agora crie a tabela de mesclagem Iceberg: `merge_table`. Para criar a tabela, copie a consulta abaixo no editor de consultas, substitua `<your-account-id>` pelo ID da conta atual e clique em **Executar** .
+5. Agora crie a tabela de mesclagem Iceberg: `merge_table`. Para criar a tabela, copie a consulta abaixo no editor de consultas, substitua `<your-account-id>` pelo ID da conta atual e clique em **Executar** .
 
 ``` sql
 CREATE TABLE athena_iceberg_db.merge_table (
