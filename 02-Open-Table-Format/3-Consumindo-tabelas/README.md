@@ -63,7 +63,7 @@ Consulte os [resultados da instrução EXPLAIN do Athena](https://docs.aws.amazo
 
 ## Criando e consultando visualizações com tabelas Iceberg
 
-1. Para criar e consultar visualizações do Athena em tabelas Iceberg, use a instrução CREATE VIEW. Copie a consulta abaixo no editor de consultas e clique em **Executar**.
+4. Para criar e consultar visualizações do Athena em tabelas Iceberg, use a instrução CREATE VIEW. Copie a consulta abaixo no editor de consultas e clique em **Executar**.
 
 ``` sql
 CREATE VIEW total_orders_by_warehouse
